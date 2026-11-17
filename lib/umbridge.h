@@ -109,7 +109,7 @@ namespace umbridge {
       }
 
       int fd = shm_open(shmem_name.c_str(), oflags, 0644); // Create shared memory
-      ftruncate(fd, length);                               // Set size of shared memory
+      [[maybe_unused]] int result = ftruncate(fd, length);                               // Set size of shared memory
       if(fd < 0){
         throw std::runtime_error("Shared Memory object could not be created or found by name");
       }

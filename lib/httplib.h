@@ -204,13 +204,14 @@ using socket_t = int;
 #include <regex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 #include <openssl/err.h>
-#include <openssl/md5.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -4019,36 +4020,32 @@ inline bool has_crlf(const char *s) {
 }
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-template <typename CTX, typename Init, typename Update, typename Final>
-inline std::string message_digest(const std::string &s, Init init,
-                                  Update update, Final final,
-                                  size_t digest_length) {
-  std::vector<unsigned char> md(digest_length, 0);
-  CTX ctx;
-  init(&ctx);
-  update(&ctx, s.data(), s.size());
-  final(md.data(), &ctx);
+inline std::string message_digest(const std::string &s, const EVP_MD *algorithm) {
+  std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+  unsigned int digest_length = 0;
+  if (EVP_Digest(s.data(), s.size(), md.data(), &digest_length, algorithm,
+                 nullptr) != 1) {
+    throw std::runtime_error("OpenSSL digest computation failed");
+  }
 
   std::stringstream ss;
-  for (auto c : md) {
+  for (unsigned int i = 0; i < digest_length; ++i) {
+    auto c = md[i];
     ss << std::setfill('0') << std::setw(2) << std::hex << (unsigned int)c;
   }
   return ss.str();
 }
 
 inline std::string MD5(const std::string &s) {
-  return message_digest<MD5_CTX>(s, MD5_Init, MD5_Update, MD5_Final,
-                                 MD5_DIGEST_LENGTH);
+  return message_digest(s, EVP_md5());
 }
 
 inline std::string SHA_256(const std::string &s) {
-  return message_digest<SHA256_CTX>(s, SHA256_Init, SHA256_Update, SHA256_Final,
-                                    SHA256_DIGEST_LENGTH);
+  return message_digest(s, EVP_sha256());
 }
 
 inline std::string SHA_512(const std::string &s) {
-  return message_digest<SHA512_CTX>(s, SHA512_Init, SHA512_Update, SHA512_Final,
-                                    SHA512_DIGEST_LENGTH);
+  return message_digest(s, EVP_sha512());
 }
 #endif
 
