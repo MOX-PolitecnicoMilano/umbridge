@@ -27,6 +27,50 @@ using json = nlohmann::json;
 
 namespace umbridge {
 
+  inline bool IsValidSessionId(const std::string& session_id) {
+    if (session_id.empty() || session_id.size() > 128) {
+      return false;
+    }
+    for (unsigned char c : session_id) {
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  inline const char* SessionHeaderName() {
+    return "UMBridge-Session";
+  }
+
+  inline std::string& request_session_id_storage() {
+    static thread_local std::string session_id;
+    return session_id;
+  }
+
+  inline const std::string& CurrentRequestSessionId() {
+    return request_session_id_storage();
+  }
+
+  class RequestSessionScope {
+  public:
+    explicit RequestSessionScope(const std::string& session_id)
+        : previous_session_id(request_session_id_storage()) {
+      request_session_id_storage() = session_id;
+    }
+
+    RequestSessionScope(const RequestSessionScope&) = delete;
+    RequestSessionScope& operator=(const RequestSessionScope&) = delete;
+
+    ~RequestSessionScope() noexcept {
+      request_session_id_storage().swap(previous_session_id);
+    }
+
+  private:
+    std::string previous_session_id;
+  };
+
   class Model {
   public:
     Model(std::string name) : name(name) {}
@@ -74,6 +118,7 @@ namespace umbridge {
     virtual bool SupportsGradient() {return false;}
     virtual bool SupportsApplyJacobian() {return false;}
     virtual bool SupportsApplyHessian() {return false;}
+    virtual void CloseSession(const std::string& session_id) { (void)session_id; }
 
     std::string GetName() const {return name;}
 
@@ -153,52 +198,87 @@ namespace umbridge {
   class HTTPModel : public Model {
   public:
 
-    HTTPModel(std::string host, std::string name, bool useShMem = false, httplib::Headers headers = httplib::Headers())
-    : Model(name), cli(host.c_str()), headers(headers)
+    HTTPModel(std::string host, std::string name, bool useShMem = false,
+              httplib::Headers headers = httplib::Headers(), std::string session_id = "")
+    : Model(name), cli(host.c_str()), headers(headers), session_id(session_id)
     {
-      // Check if requested model is available on server
-      std::vector<std::string> models = SupportedModels(host, headers);
-      if (std::find(models.begin(), models.end(), name) == models.end()) {
-        std::string model_names = "";
-        for (auto& m : models) {
-          model_names += "'" + m + "' ";
+      if (!this->session_id.empty()) {
+        if (!IsValidSessionId(this->session_id)) {
+          throw std::invalid_argument("Session ID must contain 1-128 ASCII letters, digits, underscores, or hyphens.");
         }
-        throw std::runtime_error("Model " + name + " not found on server! Available models: " + model_names + ".");
+        if (this->headers.find(SessionHeaderName()) != this->headers.end()) {
+          throw std::invalid_argument("Session ID was specified both directly and in HTTP headers.");
+        }
+        this->headers.emplace(SessionHeaderName(), this->session_id);
+      }
+
+      try {
+        // Check if requested model is available on server
+        std::vector<std::string> models = SupportedModels(host, this->headers);
+        if (std::find(models.begin(), models.end(), name) == models.end()) {
+          std::string model_names = "";
+          for (auto& m : models) {
+            model_names += "'" + m + "' ";
+          }
+          throw std::runtime_error("Model " + name + " not found on server! Available models: " + model_names + ".");
+        }
+
+        json request_body;
+        request_body["name"] = name;
+
+        if (auto res = cli.Post("/ModelInfo", this->headers, request_body.dump(), "application/json")) {
+          json response = json::parse(res->body);
+
+          json supported_features = response.at("support");
+          supportsEvaluate = supported_features.value("Evaluate", false);
+          supportsGradient = supported_features.value("Gradient", false);
+          supportsApplyJacobian = supported_features.value("ApplyJacobian", false);
+          supportsApplyHessian = supported_features.value("ApplyHessian", false);
+
+        } else {
+          throw std::runtime_error("POST ModelInfo failed with error type '" + to_string(res.error()) + "'");
+        }
+#ifdef SUPPORT_POSIX_SHMEM
+        // Test whether client and server are able to communicate through shared memory. Disables ShMem if test fails.
+        if (useShMem) {
+          unsigned long int tid = pthread_self();
+          request_body["tid"] = std::to_string(tid);
+          std::vector<double> testvec = {12345.0};
+          SharedMemoryVector shmem_input(testvec, "/umbridge_test_shmem_in_" + std::to_string(tid));
+          SharedMemoryVector shmem_output(1, "/umbridge_test_shmem_out_" + std::to_string(tid), true);
+          auto res = cli.Post("/TestShMem", this->headers, request_body.dump(), "application/json");
+
+          if (shmem_output.GetVector()[0] != testvec[0]) {
+            std::cout << "Server not accessible via shared memory. Using HTTP instead." << std::endl;
+          } else {
+            supportsShMem = true;
+            std::cout << "Server accessible via shared memory" << std::endl;
+          }
+        }
+#endif
+      } catch (...) {
+        close_session_after_failed_initialization();
+        throw;
+      }
+    }
+
+    void CloseSession() {
+      if (session_id.empty()) {
+        return;
       }
 
       json request_body;
       request_body["name"] = name;
-
-      if (auto res = cli.Post("/ModelInfo", headers, request_body.dump(), "application/json")) {
-        json response = json::parse(res->body);
-
-        json supported_features = response.at("support");
-        supportsEvaluate = supported_features.value("Evaluate", false);
-        supportsGradient = supported_features.value("Gradient", false);
-        supportsApplyJacobian = supported_features.value("ApplyJacobian", false);
-        supportsApplyHessian = supported_features.value("ApplyHessian", false);
-        
-      } else {
-        throw std::runtime_error("POST ModelInfo failed with error type '" + to_string(res.error()) + "'");
-      }
-#ifdef SUPPORT_POSIX_SHMEM
-      // Test whether client and server are able to communicate through shared memory. Disables ShMem if test fails.
-      if (useShMem) {
-        unsigned long int tid = pthread_self();
-        request_body["tid"] = std::to_string(tid);
-        std::vector<double> testvec = {12345.0};
-        SharedMemoryVector shmem_input(testvec, "/umbridge_test_shmem_in_" + std::to_string(tid));
-        SharedMemoryVector shmem_output(1, "/umbridge_test_shmem_out_" + std::to_string(tid), true);
-        auto res = cli.Post("/TestShMem", headers, request_body.dump(), "application/json");
-
-        if (shmem_output.GetVector()[0] != testvec[0]) {
-          std::cout << "Server not accessible via shared memory. Using HTTP instead." << std::endl;
-        } else {
-          supportsShMem = true;
-          std::cout << "Server accessible via shared memory" << std::endl;
+      if (auto res = cli.Post("/CloseSession", headers, request_body.dump(), "application/json")) {
+        if (res->status < 200 || res->status >= 300) {
+          throw std::runtime_error("POST CloseSession failed with HTTP status " + std::to_string(res->status) + ".");
         }
+      } else {
+        throw std::runtime_error("POST CloseSession failed with error type '" + to_string(res.error()) + "'");
       }
-#endif
+
+      session_id.clear();
+      headers.erase(SessionHeaderName());
     }
 
     std::vector<std::size_t> GetInputSizes(const json& config_json = json::parse("{}")) const override {
@@ -506,6 +586,7 @@ namespace umbridge {
 
     mutable httplib::Client cli;
     httplib::Headers headers;
+    std::string session_id;
 
     bool supportsEvaluate = false;
     bool supportsGradient = false;
@@ -514,6 +595,18 @@ namespace umbridge {
 #ifdef SUPPORT_POSIX_SHMEM
     bool supportsShMem = false;
 #endif
+
+    void close_session_after_failed_initialization() {
+      if (session_id.empty()) {
+        return;
+      }
+      try {
+        CloseSession();
+      } catch (const std::exception& error) {
+        std::cerr << "HTTPModel: failed to close session after initialization error: "
+                  << error.what() << std::endl;
+      }
+    }
     
     json parse_result_with_error_handling(const httplib::Result& res) const {
       json response_body;
@@ -676,6 +769,7 @@ namespace umbridge {
 
     svr.Post("/Evaluate", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (error_checks && !check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -720,6 +814,7 @@ namespace umbridge {
 #ifdef SUPPORT_POSIX_SHMEM
     svr.Post("/EvaluateShMem", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -765,6 +860,7 @@ namespace umbridge {
 #endif
     svr.Post("/Gradient", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (error_checks && !check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -814,6 +910,7 @@ namespace umbridge {
 #ifdef SUPPORT_POSIX_SHMEM
     svr.Post("/GradientShMem", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -860,6 +957,7 @@ namespace umbridge {
 
     svr.Post("/ApplyJacobian", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (error_checks && !check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -908,6 +1006,7 @@ namespace umbridge {
 #ifdef SUPPORT_POSIX_SHMEM
     svr.Post("/ApplyJacobianShMem", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -951,6 +1050,7 @@ namespace umbridge {
 #endif
     svr.Post("/ApplyHessian", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (error_checks && !check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -1013,6 +1113,7 @@ namespace umbridge {
 #ifdef SUPPORT_POSIX_SHMEM
     svr.Post("/ApplyHessianShMem", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -1082,6 +1183,7 @@ namespace umbridge {
 
     svr.Post("/ModelInfo", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -1095,8 +1197,26 @@ namespace umbridge {
       res.set_content(response_body.dump(), "application/json");
     });
 
+    svr.Post("/CloseSession", [&](const httplib::Request &req, httplib::Response &res) {
+      json request_body = json::parse(req.body);
+      if (!check_model_exists(models, request_body["name"], res))
+        return;
+
+      const std::string session_id = req.get_header_value(SessionHeaderName());
+      if (!IsValidSessionId(session_id)) {
+        res.status = 400;
+        res.set_content("Invalid or missing UMBridge-Session header.", "text/plain");
+        return;
+      }
+
+      Model& model = get_model_from_name(models, request_body["name"]);
+      model.CloseSession(session_id);
+      res.set_content("{}", "application/json");
+    });
+
     svr.Post("/InputSizes", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
@@ -1112,6 +1232,7 @@ namespace umbridge {
 
     svr.Post("/OutputSizes", [&](const httplib::Request &req, httplib::Response &res) {
       json request_body = json::parse(req.body);
+      RequestSessionScope session_scope(req.get_header_value(SessionHeaderName()));
       if (!check_model_exists(models, request_body["name"], res))
         return;
       Model& model = get_model_from_name(models, request_body["name"]);
