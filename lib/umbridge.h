@@ -17,6 +17,7 @@
 #define CPPHTTPLIB_READ_TIMEOUT_SECOND 60*60*24*365
 
 #include <string>
+#include <functional>
 #include <vector>
 
 
@@ -762,9 +763,15 @@ namespace umbridge {
   }
 
   // Provides access to a model via network
-  void serveModels(std::vector<Model*> models, std::string host, int port, bool enable_parallel = false, bool error_checks = true) {
+  void serveModels(std::vector<Model*> models, std::string host, int port, bool enable_parallel = false, bool error_checks = true,
+                   std::function<httplib::TaskQueue*()> task_queue_factory = {}) {
 
     httplib::Server svr;
+    // Allow scheduler proxies to avoid exhausting a fixed HTTP worker pool
+    // while backend allocation requests wait for sessions to release jobs.
+    if (task_queue_factory) {
+      svr.new_task_queue = std::move(task_queue_factory);
+    }
     std::mutex model_mutex; // Ensure the underlying model is only called sequentially
 
     svr.Post("/Evaluate", [&](const httplib::Request &req, httplib::Response &res) {
